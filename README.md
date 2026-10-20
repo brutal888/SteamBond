@@ -1,4 +1,4 @@
-<p align="center"><img src="SteamBond.ico" width="96" alt="SteamBond icon"></p>
+﻿<p align="center"><img src="SteamBond.ico" width="96" alt="SteamBond icon"></p>
 
 <h1 align="center">SteamBond</h1>
 
@@ -10,7 +10,7 @@ Wi-Fi + Ethernet, or home internet + your phone over USB tethering.</p>
 ## Install
 
 1. Download **`SteamBond-Setup.exe`** from the [latest release](https://github.com/brutal888/SteamBond/releases/latest).
-2. Run it. If Windows shows **"Windows protected your PC"**, click **More info** → **Run anyway** (the app isn't code-signed).
+2. Run it. If Windows shows **"Windows protected your PC"**, click **More info** â†’ **Run anyway** (the app isn't code-signed).
 3. Click **Yes** when Windows asks for admin rights. Setup takes about a minute and opens SteamBond.
 
 Or paste this into PowerShell:
@@ -27,6 +27,7 @@ Setup puts SteamBond in `%LOCALAPPDATA%\SteamBond`, adds Desktop and Start Menu 
 1. Connect both internet connections (for example home Wi-Fi + phone on USB tethering).
 2. Open **SteamBond**, tick both networks and press **Start**. It tests each network's speed for 6 seconds.
 3. Press **Restart Steam** and start your download.
+4. For any other big file: copy the download link in Chrome (right-click → **Copy link address**) and press **Download** on the **Downloads** tab.
 
 Watch the graph: both networks should be busy. Steam's own download speed should beat either network alone.
 
@@ -36,13 +37,13 @@ Only if **each network has its own internet**:
 
 | Setup | Faster? |
 |---|---|
-| Home Wi-Fi + phone (USB tethering or hotspot) | ✅ Yes |
-| Two different internet providers | ✅ Yes |
-| Wi-Fi and Ethernet from the **same** router | ❌ No, both share one connection* |
+| Home Wi-Fi + phone (USB tethering or hotspot) | âœ… Yes |
+| Two different internet providers | âœ… Yes |
+| Wi-Fi and Ethernet from the **same** router | âŒ No, both share one connection* |
 
 \* Exception: if your Ethernet cable or port is capped at 100 Mbps and your plan is faster, Wi-Fi can add the rest.
 
-⚠️ **Watch your mobile data.** Smart split sends more traffic to the faster network, which is often the phone.
+âš ï¸ **Watch your mobile data.** Smart split sends more traffic to the faster network, which is often the phone.
 
 ## Features
 
@@ -51,6 +52,7 @@ Only if **each network has its own internet**:
 - **Only games use it.** Steam, Epic Games, EA app, Ubisoft Connect, Battle.net and (optionally) browsers. Everything else stays on your main network.
 - **Auto-recover.** Unplug your phone and it carries on. Plug it back in and it's added again.
 - **Auto mode.** Switches on when Steam starts downloading and off when it's done.
+- **Downloads tab (new in 2.1).** Paste or copy any download link and SteamBond fetches it in pieces over all your networks, then joins them. Works for single files, unlike Chrome. Links that need a login won't work.
 - **Live graph, per-network stats and history** per day, per network and per game.
 - **Tray icon.** Closing the window keeps it running by the clock.
 - **No admin popup** after the first install.
@@ -64,11 +66,11 @@ uses your main network. No VPN server, no account, nothing leaves your PC except
 
 ## Uninstall
 
-**Settings → Apps → Installed apps → SteamBond → Uninstall**, or run `uninstall.ps1` in `%LOCALAPPDATA%\SteamBond`.
+**Settings â†’ Apps â†’ Installed apps â†’ SteamBond â†’ Uninstall**, or run `uninstall.ps1` in `%LOCALAPPDATA%\SteamBond`.
 
 ## Troubleshooting
 
-- **A network doesn't show up.** It needs internet access of its own. On Windows, if Wi-Fi turns off when Ethernet is plugged in, open `gpedit.msc` → *Computer Configuration › Administrative Templates › Network › Windows Connection Manager* → set **Minimize the number of simultaneous connections** to **Disabled**.
+- **A network doesn't show up.** It needs internet access of its own. On Windows, if Wi-Fi turns off when Ethernet is plugged in, open `gpedit.msc` â†’ *Computer Configuration â€º Administrative Templates â€º Network â€º Windows Connection Manager* â†’ set **Minimize the number of simultaneous connections** to **Disabled**.
 - **Antivirus warning.** mihomo is a network tool, and some antivirus products flag it. SteamBond downloads it only from the official MetaCubeX release and checks its hash.
 - **Internet stops working.** Open SteamBond and press **Stop**, or exit it from the tray. Your connection goes back to normal immediately.
 

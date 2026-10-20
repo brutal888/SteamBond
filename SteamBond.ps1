@@ -47,7 +47,7 @@ function ConvertTo-NumberHash($o) {
 
 $script:Settings = @{
     networks = @(); main = ''; smartSplit = $true; weights = @{}; speeds = @{}
-    apps = @('Steam'); autoMode = $false; autoRestartSteam = $false; closeToTray = $true; trayHintShown = $false
+    apps = @('Steam'); downloadDir = ''; watchClipboard = $true; autoMode = $false; autoRestartSteam = $false; closeToTray = $true; trayHintShown = $false
 }
 if (Test-Path $SettingsFile) {
     try {
@@ -66,7 +66,7 @@ if (Test-Path $HistoryFile) {
     try {
         $j = Get-Content $HistoryFile -Raw | ConvertFrom-Json
         foreach ($d in $j.PSObject.Properties) {
-            $script:History[$d.Name] = @{ networks = ConvertTo-NumberHash $d.Value.networks; apps = ConvertTo-NumberHash $d.Value.apps; games = ConvertTo-NumberHash $d.Value.games }
+            $script:History[$d.Name] = @{ networks = ConvertTo-NumberHash $d.Value.networks; apps = ConvertTo-NumberHash $d.Value.apps; games = ConvertTo-NumberHash $d.Value.games; files = ConvertTo-NumberHash $d.Value.files }
         }
     } catch {}
 }
@@ -74,7 +74,8 @@ function Save-History { try { $script:History | ConvertTo-Json -Depth 5 | Set-Co
 function Add-History($kind, $name, [double]$bytes) {
     if ($bytes -le 0 -or -not $name) { return }
     $day = (Get-Date).ToString('yyyy-MM-dd')
-    if (-not $script:History.ContainsKey($day)) { $script:History[$day] = @{ networks = @{}; apps = @{}; games = @{} } }
+    if (-not $script:History.ContainsKey($day)) { $script:History[$day] = @{ networks = @{}; apps = @{}; games = @{}; files = @{} } }
+    if (-not $script:History[$day].ContainsKey($kind)) { $script:History[$day][$kind] = @{} }
     $bucket = $script:History[$day][$kind]
     if ($bucket.ContainsKey($name)) { $bucket[$name] += $bytes } else { $bucket[$name] = $bytes }
 }
@@ -348,6 +349,239 @@ function Stop-Bond([switch]$Quiet) {
     if (-not $Quiet) { Set-Status 'Stopped - internet is back to normal' 'Black'; Update-Buttons }
 }
 
+# ---------- split downloads ----------
+# A file is cut into chunks; each network runs a few curl.exe workers (more on faster networks) bound to
+# that network's IP, taking chunks from a shared queue. Works whether or not Start is pressed.
+$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+$script:Downloads = New-Object Collections.Generic.List[object]
+$script:NextDownloadId = 1
+
+function Get-DownloadDir {
+    $d = $script:Settings.downloadDir
+    if ($d -and (Test-Path $d)) { return $d }
+    try { $d = (New-Object -ComObject Shell.Application).Namespace('shell:Downloads').Self.Path } catch {}
+    if (-not $d) { $d = Join-Path $env:USERPROFILE 'Downloads' }
+    $d
+}
+
+function Quote-Arg($a) { '"' + ($a -replace '"', '\"') + '"' }
+function Start-Curl($argList) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'curl.exe'
+    $psi.Arguments = ($argList | ForEach-Object { Quote-Arg $_ }) -join ' '
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    [Diagnostics.Process]::Start($psi)
+}
+
+function Get-SafeName($name) {
+    foreach ($ch in [IO.Path]::GetInvalidFileNameChars()) { $name = ('' + $name).Replace([string]$ch, '_') }
+    $name = $name.Trim(' ', '.')
+    if (-not $name) { 'download' } else { $name }
+}
+
+function Get-FreePath($dir, $name) {
+    $p = Join-Path $dir $name
+    $base = [IO.Path]::GetFileNameWithoutExtension($name); $ext = [IO.Path]::GetExtension($name); $i = 1
+    while ((Test-Path $p) -or ($script:Downloads.ToArray() | Where-Object { $_.Path -eq $p -and $_.Status -notmatch '^(Failed|Cancelled)' })) { $p = Join-Path $dir "$base ($i)$ext"; $i++ }
+    $p
+}
+
+# Asks the server for byte 0 only: a 206 answer means it can be split, Content-Range gives the size.
+function Test-DownloadUrl($url, $ip) {
+    $hdr = Join-Path $env:TEMP "steambond-probe-$PID.txt"
+    $a = @('-4', '-s', '-L', '--max-redirs', '10', '-r', '0-0', '--max-filesize', '1', '-m', '20', '-A', $UserAgent, '-D', $hdr, '-o', 'NUL', '-w', '%{http_code}|%{url_effective}')
+    if ($ip) { $a += @('--interface', $ip) }
+    $p = Start-Curl ($a + $url)
+    while (-not $p.HasExited) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+    $res = @{ Code = 0; Size = -1; Ranges = $false; Name = $null; Error = $null }
+    $headers = if (Test-Path $hdr) { Get-Content $hdr -Raw } else { '' }
+    Remove-Item $hdr -ErrorAction SilentlyContinue
+    # keep only the last response (after redirects)
+    $blocks = @($headers -split '(?m)^(?=HTTP/)') | Where-Object { $_.Trim() }
+    $last = if ($blocks.Count) { $blocks[-1] } else { '' }
+    if ($last -match '^HTTP/\S+\s+(\d+)') { $res.Code = [int]$Matches[1] }
+    if ($last -match '(?im)^content-range:\s*bytes\s+\d+-\d+/(\d+)') { $res.Size = [int64]$Matches[1]; $res.Ranges = ($res.Code -eq 206) }
+    elseif ($last -match '(?im)^content-length:\s*(\d+)') { $res.Size = [int64]$Matches[1] }
+    if ($last -match "(?im)^content-disposition:.*filename\*=(?:UTF-8|utf-8)''([^;\r\n]+)") { $res.Name = [uri]::UnescapeDataString($Matches[1].Trim('"')) }
+    elseif ($last -match '(?im)^content-disposition:.*filename="?([^";\r\n]+)"?') { $res.Name = $Matches[1].Trim() }
+    if (-not $res.Name) {
+        try { $u = [uri]$url; $res.Name = [uri]::UnescapeDataString(($u.AbsolutePath -split '/')[-1]) } catch {}
+    }
+    if ($res.Code -eq 0) { $res.Error = 'Could not reach the server' }
+    elseif ($res.Code -in 401, 403) { $res.Error = "Server refused ($($res.Code)) - the link may need you to be logged in, so download it in Chrome instead" }
+    elseif ($res.Code -ge 400) { $res.Error = "Server error $($res.Code) - the link may have expired" }
+    $res
+}
+
+function Get-DownloadWorkers {
+    # Slots per network follow the smart-split weights; one network alone still gets 4 parallel streams.
+    $nets = @(Get-WantedNets | ForEach-Object { $n = $_; $script:Nets | Where-Object { $_.Name -eq $n } | Select-Object -First 1 })
+    if (-not $nets.Count) { $nets = @($script:Nets | Select-Object -First 1) }
+    $slots = @()
+    foreach ($n in $nets) {
+        $k = if ($nets.Count -eq 1) { 4 } else { [math]::Min(6, 1 + (Get-Weight $n.Name)) }
+        for ($i = 0; $i -lt $k; $i++) { $slots += @{ Net = $n.Name; IP = $n.IP; Proc = $null; Chunk = $null; Seen = 0L } }
+    }
+    $slots
+}
+
+function Add-Download($url) {
+    $url = $url.Trim()
+    if ($url -notmatch '^https?://') { [Windows.Forms.MessageBox]::Show('Paste a link starting with http:// or https://', 'SteamBond') | Out-Null; return }
+    $script:Nets = @(Get-Networks)
+    Set-DlStatus 'Checking the link...'
+    # Try the main network first, then the others, in case one of them is down
+    $ips = @(Get-WantedNets | ForEach-Object { $n = $_; ($script:Nets | Where-Object { $_.Name -eq $n } | Select-Object -First 1).IP }) + @($null)
+    foreach ($ip in $ips) { $info = Test-DownloadUrl $url $ip; if ($info.Code -ne 0) { break } }
+    if ($info.Error) { Set-DlStatus ''; [Windows.Forms.MessageBox]::Show($info.Error, 'SteamBond') | Out-Null; return }
+    $dir = Get-DownloadDir
+    $path = Get-FreePath $dir (Get-SafeName $info.Name)
+    $id = $script:NextDownloadId++
+    $temp = Join-Path $dir ".steambond-$PID-$id"
+    New-Item -ItemType Directory -Force $temp | Out-Null
+    (Get-Item $temp).Attributes = 'Hidden, Directory'
+
+    $chunks = New-Object Collections.Generic.List[object]
+    $workers = @(Get-DownloadWorkers)
+    if ($info.Ranges -and $info.Size -gt 0) {
+        $size = [int64][math]::Min([math]::Max($info.Size / ($workers.Count * 6), 4MB), 128MB)
+        for ($start = 0L; $start -lt $info.Size; $start += $size) {
+            $chunks.Add(@{ Start = $start; End = [math]::Min($start + $size, $info.Size) - 1; State = 'todo'; Tries = 0 })
+        }
+    } else {
+        $chunks.Add(@{ Start = 0L; End = -1L; State = 'todo'; Tries = 0 })   # server can't split: one stream
+        $workers = @($workers | Select-Object -First 1)
+    }
+    $dl = @{
+        Id = $id; Url = $url; Name = [IO.Path]::GetFileName($path); Path = $path; Temp = $temp
+        Size = $info.Size; Ranges = $info.Ranges; Chunks = $chunks; Workers = $workers
+        Status = 'Downloading'; Done = 0L; NetBytes = @{}; Samples = New-Object Collections.Generic.List[object]
+        Speed = 0.0; Merge = $null; Started = Get-Date
+    }
+    $script:Downloads.Add($dl)
+    Set-DlStatus "Downloading $($dl.Name)$(if (-not $info.Ranges) { ' (this server only allows one stream)' })"
+    Refresh-DownloadList
+}
+
+function Get-PartPath($dl, $chunk) { Join-Path $dl.Temp ('{0:D6}.part' -f $dl.Chunks.IndexOf($chunk)) }
+function Get-FileLength($p) { try { (New-Object IO.FileInfo($p)).Length } catch { 0L } }
+
+function Stop-DownloadWorkers($dl) {
+    foreach ($w in $dl.Workers) {
+        if ($w.Proc -and -not $w.Proc.HasExited) { try { $w.Proc.Kill() } catch {} }
+        if ($w.Chunk -and $w.Chunk.State -eq 'run') { $w.Chunk.State = 'todo' }
+        $w.Proc = $null; $w.Chunk = $null; $w.Seen = 0L
+    }
+}
+
+# Runs every 200 ms: collect finished chunks, hand out new ones, count bytes per network.
+function Step-Downloads {
+    $upNames = @($script:Nets | ForEach-Object { $_.Name })
+    foreach ($dl in $script:Downloads.ToArray()) {
+        if ($dl.Status -eq 'Merging') {
+            if ($dl.Merge.Handle.IsCompleted) {
+                $ok = -not $dl.Merge.PS.HadErrors
+                $dl.Merge.PS.Dispose(); $dl.Merge = $null
+                $dl.Status = if ($ok) { 'Done' } else { 'Failed: could not join the pieces (disk full?)' }
+                if ($ok) { Show-Tip "Downloaded $($dl.Name)"; Set-DlStatus "Finished $($dl.Name)"; Add-History 'files' $dl.Name ([double]$dl.Done) } else { Set-DlStatus "$($dl.Name): $($dl.Status)" }
+                Refresh-DownloadList
+            }
+            continue
+        }
+        if ($dl.Status -ne 'Downloading') { continue }
+
+        foreach ($w in $dl.Workers) {
+            # count bytes of the running piece
+            if ($w.Chunk) {
+                $len = Get-FileLength (Get-PartPath $dl $w.Chunk)
+                $delta = $len - $w.Seen
+                if ($delta -gt 0) {
+                    $w.Seen = $len
+                    if ($dl.NetBytes.ContainsKey($w.Net)) { $dl.NetBytes[$w.Net] += $delta } else { $dl.NetBytes[$w.Net] = [double]$delta }
+                    Add-History 'networks' $w.Net $delta; Add-History 'apps' 'Downloads' $delta
+                }
+            }
+            # piece finished?
+            if ($w.Proc -and $w.Proc.HasExited) {
+                $c = $w.Chunk
+                $len = Get-FileLength (Get-PartPath $dl $c)
+                $expected = if ($c.End -ge 0) { $c.End - $c.Start + 1 } else { $len }
+                if ($w.Proc.ExitCode -eq 0 -and $len -eq $expected -and $len -gt 0) {
+                    $c.State = 'done'; $c.Len = $len
+                } elseif ($c.End -ge 0 -and $len -gt $expected) {
+                    $c.State = 'todo'; $c.Tries = 99   # server ignored the range request
+                } else {
+                    $c.State = 'todo'; $c.Tries++
+                    Remove-Item (Get-PartPath $dl $c) -ErrorAction SilentlyContinue
+                }
+                $w.LastExit = $w.Proc.ExitCode
+                $w.Proc = $null; $w.Chunk = $null; $w.Seen = 0L
+                if ($c.Tries -ge 6) {
+                    Stop-DownloadWorkers $dl
+                    Set-DlStatus "$($dl.Name) failed"; $dl.Status = if ($c.Tries -eq 99) { 'Failed: server sent the wrong piece' } else { "Failed: piece kept failing (curl error $($w.LastExit))" }
+                    Refresh-DownloadList; break
+                }
+            }
+            # give an idle worker the next piece (skip networks that are unplugged)
+            if (-not $w.Proc -and $w.Net -in $upNames) {
+                $c = $dl.Chunks | Where-Object { $_.State -eq 'todo' } | Select-Object -First 1
+                if ($c) {
+                    $part = Get-PartPath $dl $c
+                    Remove-Item $part -ErrorAction SilentlyContinue
+                    $a = @('-4', '-s', '-L', '--fail', '--max-redirs', '10', '--connect-timeout', '15', '--speed-limit', '2048', '--speed-time', '30', '-A', $UserAgent, '--interface', $w.IP, '-o', $part)
+                    if ($c.End -ge 0) { $a += @('-r', "$($c.Start)-$($c.End)") }
+                    $w.Proc = Start-Curl ($a + $dl.Url)
+                    $w.Chunk = $c; $w.Seen = 0L; $c.State = 'run'; $c.Net = $w.Net
+                }
+            }
+
+        }
+        if ($dl.Status -ne 'Downloading') { continue }
+
+        # progress and speed (averaged over the last 3 seconds)
+        $done = 0L
+        foreach ($c in $dl.Chunks) {
+            if ($c.State -eq 'done') { $done += $c.Len } elseif ($c.State -eq 'run') { $done += Get-FileLength (Get-PartPath $dl $c) }
+        }
+        $dl.Done = $done
+        $now = Get-Date
+        $dl.Samples.Add(@{ T = $now; B = $done })
+        while ($dl.Samples.Count -gt 2 -and ($now - $dl.Samples[0].T).TotalSeconds -gt 3) { $dl.Samples.RemoveAt(0) }
+        $span = ($now - $dl.Samples[0].T).TotalSeconds
+        $dl.Speed = if ($span -gt 0.5) { ($done - $dl.Samples[0].B) / $span } else { 0 }
+
+        # all pieces in: join them in the background so the window stays responsive
+        if (-not ($dl.Chunks | Where-Object { $_.State -ne 'done' })) {
+            $parts = @(for ($i = 0; $i -lt $dl.Chunks.Count; $i++) { Join-Path $dl.Temp ('{0:D6}.part' -f $i) })
+            $dl.Status = 'Merging'; $dl.Speed = 0
+            $ps = [PowerShell]::Create()
+            [void]$ps.AddScript({
+                param($parts, $dest, $temp)
+                $ErrorActionPreference = 'Stop'
+                if ($parts.Count -eq 1) { Move-Item $parts[0] $dest }
+                else {
+                    $out = [IO.File]::Create($dest)
+                    try { foreach ($p in $parts) { $in = [IO.File]::OpenRead($p); try { $in.CopyTo($out, 4MB) } finally { $in.Close() } } } finally { $out.Close() }
+                }
+                Remove-Item $temp -Recurse -Force
+            }).AddArgument($parts).AddArgument($dl.Path).AddArgument($dl.Temp)
+            $dl.Merge = @{ PS = $ps; Handle = $ps.BeginInvoke() }
+            Refresh-DownloadList
+        }
+    }
+}
+
+function Suspend-Download($dl) { if ($dl.Status -eq 'Downloading') { Stop-DownloadWorkers $dl; $dl.Status = 'Paused'; $dl.Speed = 0 } }
+function Resume-Download($dl) {
+    if ($dl.Status -ne 'Paused') { return }
+    $script:Nets = @(Get-Networks)
+    if ($dl.Ranges) { $dl.Workers = @(Get-DownloadWorkers) }
+    foreach ($c in $dl.Chunks) { if ($c.State -eq 'run') { $c.State = 'todo' } }
+    $dl.Samples.Clear(); $dl.Status = 'Downloading'
+}
+function Remove-DownloadTemp($dl) { Stop-DownloadWorkers $dl; Remove-Item $dl.Temp -Recurse -Force -ErrorAction SilentlyContinue }
+function Stop-AllDownloads { foreach ($dl in $script:Downloads) { if ($dl.Status -in 'Downloading', 'Paused') { Remove-DownloadTemp $dl } } }
+
 # ---------- UI ----------
 function Font([float]$size, [switch]$Bold) { New-Object Drawing.Font('Segoe UI', $size, $(if ($Bold) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular })) }
 function Add-Label($parent, $text, $x, $y, $w, $h, [switch]$Dim) {
@@ -375,10 +609,11 @@ $tabs = New-Object Windows.Forms.TabControl
 $tabs.SetBounds(8, 8, 584, 584)
 $form.Controls.Add($tabs)
 $tabMain = New-Object Windows.Forms.TabPage('Connect')
+$tabDl   = New-Object Windows.Forms.TabPage('Downloads')
 $tabApps = New-Object Windows.Forms.TabPage('Apps')
 $tabHist = New-Object Windows.Forms.TabPage('History')
 $tabSet  = New-Object Windows.Forms.TabPage('Settings')
-$tabs.TabPages.AddRange(@($tabMain, $tabApps, $tabHist, $tabSet))
+$tabs.TabPages.AddRange(@($tabMain, $tabDl, $tabApps, $tabHist, $tabSet))
 
 # --- Connect tab ---
 $t = Add-Label $tabMain 'Networks to combine' 12 10 300 20; $t.Font = Font 10 -Bold
@@ -419,6 +654,33 @@ $tabMain.Controls.Add($grid)
 $total = Add-Label $tabMain '' 12 474 550 28
 $total.Font = Font 13 -Bold
 $steamInfo = Add-Label $tabMain '' 12 504 550 40 -Dim
+
+# --- Downloads tab ---
+$t = Add-Label $tabDl 'Download a file over all your networks' 12 10 540 20; $t.Font = Font 10 -Bold
+[void](Add-Label $tabDl 'In Chrome: right-click the download link > Copy link address. It appears here.' 12 32 550 20 -Dim)
+$urlBox = New-Object Windows.Forms.TextBox
+$urlBox.SetBounds(12, 60, 430, 26)
+$tabDl.Controls.Add($urlBox)
+$dlBtn = Add-Button $tabDl 'Download' 450 57 110 31
+$dlBtn.Font = Font 10 -Bold
+$dlBtn.BackColor = [Drawing.Color]::FromArgb(46, 125, 50); $dlBtn.ForeColor = [Drawing.Color]::White; $dlBtn.FlatStyle = 'Flat'
+$dirLbl = Add-Label $tabDl '' 12 98 430 20 -Dim
+$dirBtn = Add-Button $tabDl 'Change folder' 450 93 110 28
+
+$dlView = New-Object Windows.Forms.ListView
+$dlView.View = 'Details'; $dlView.FullRowSelect = $true; $dlView.HeaderStyle = 'Nonclickable'; $dlView.MultiSelect = $false; $dlView.HideSelection = $false
+$dlView.SetBounds(12, 128, 548, 300)
+foreach ($c in @(@('File', 170), @('Size', 75), @('Done', 55), @('Speed / status', 110), @('Split', 120))) { [void]$dlView.Columns.Add($c[0], $c[1]) }
+$tabDl.Controls.Add($dlView)
+
+$dlStatus = Add-Label $tabDl '' 12 434 548 20 -Dim
+$pauseBtn  = Add-Button $tabDl 'Pause' 12 458 100 30
+$cancelBtn = Add-Button $tabDl 'Cancel' 118 458 90 30
+$openBtn   = Add-Button $tabDl 'Open' 214 458 80 30
+$showBtn   = Add-Button $tabDl 'Show in folder' 300 458 120 30
+$clearBtn  = Add-Button $tabDl 'Clear finished' 426 458 134 30
+$clipChk = Add-Check $tabDl 'Pick up download links I copy' 12 498 400 $script:Settings.watchClipboard
+[void](Add-Label $tabDl 'Works without pressing Start. Links that need you logged in (some Google Drive, Mega) won''t work - use Chrome for those.' 12 524 550 36 -Dim)
 
 # --- Apps tab ---
 $t = Add-Label $tabApps 'Which apps get the combined speed' 12 10 500 20; $t.Font = Font 10 -Bold
@@ -534,7 +796,7 @@ function Fill-History {
         $sum = ($h.networks.Values | Measure-Object -Sum).Sum
         $g = New-Object Windows.Forms.ListViewGroup("$d   -   total $(Fmt $sum)")
         [void]$histView.Groups.Add($g)
-        foreach ($kind in @(@('games', 'Game'), @('apps', 'App'), @('networks', 'Network'))) {
+        foreach ($kind in @(@('games', 'Game'), @('files', 'File'), @('apps', 'App'), @('networks', 'Network'))) {
             foreach ($k in ($h[$kind[0]].Keys | Sort-Object { -$h[$kind[0]][$_] })) {
                 $it = New-Object Windows.Forms.ListViewItem("$($kind[1]):  $k", $g)
                 [void]$it.SubItems.Add((Fmt $h[$kind[0]][$k]))
@@ -756,9 +1018,102 @@ $taskBtn.Add_Click({
     } catch { [Windows.Forms.MessageBox]::Show("Setup failed:`n$($_.Exception.Message)", 'SteamBond') | Out-Null }
 })
 
+# ---------- Downloads tab logic ----------
+function Set-DlStatus($text) { $dlStatus.Text = $text; [Windows.Forms.Application]::DoEvents() }
+function Get-SelectedDownload {
+    if ($dlView.SelectedItems.Count -eq 0) { return $null }
+    $id = $dlView.SelectedItems[0].Tag
+    $script:Downloads.ToArray() | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+}
+function Update-DlButtons {
+    $dl = Get-SelectedDownload
+    $pauseBtn.Text = if ($dl -and $dl.Status -eq 'Paused') { 'Resume' } else { 'Pause' }
+    $pauseBtn.Enabled = $dl -and $dl.Status -in 'Downloading', 'Paused'
+    $cancelBtn.Enabled = $dl -and $dl.Status -in 'Downloading', 'Paused'
+    $openBtn.Enabled = $dl -and $dl.Status -eq 'Done'
+    $showBtn.Enabled = [bool]$dl
+}
+function Refresh-DownloadList {
+    $selId = if ($dlView.SelectedItems.Count) { $dlView.SelectedItems[0].Tag } else { $null }
+    $dlView.BeginUpdate(); $dlView.Items.Clear()
+    foreach ($dl in $script:Downloads.ToArray()) {
+        $it = New-Object Windows.Forms.ListViewItem($dl.Name)
+        $it.Tag = $dl.Id
+        [void]$it.SubItems.Add($(if ($dl.Size -gt 0) { Fmt $dl.Size } else { '?' }))
+        [void]$it.SubItems.Add($(if ($dl.Status -eq 'Done') { '100%' } elseif ($dl.Size -gt 0) { '{0:N0}%' -f (100 * $dl.Done / $dl.Size) } else { Fmt $dl.Done }))
+        [void]$it.SubItems.Add($(if ($dl.Status -eq 'Downloading') { '{0:N1} MB/s' -f ($dl.Speed / 1MB) } else { $dl.Status }))
+        $sum = ($dl.NetBytes.Values | Measure-Object -Sum).Sum
+        [void]$it.SubItems.Add($(if ($sum -gt 0) { ($dl.NetBytes.Keys | Sort-Object | ForEach-Object { '{0} {1:N0}%' -f $_, (100 * $dl.NetBytes[$_] / $sum) }) -join ', ' } else { '-' }))
+        if ($dl.Status -like 'Failed*') { $it.ForeColor = [Drawing.Color]::Firebrick } elseif ($dl.Status -eq 'Done') { $it.ForeColor = [Drawing.Color]::ForestGreen }
+        $it.ToolTipText = $dl.Status
+        [void]$dlView.Items.Add($it)
+        if ($selId -eq $dl.Id) { $it.Selected = $true }
+    }
+    $dlView.EndUpdate()
+    Update-DlButtons
+}
+function Update-DirLabel { $dirLbl.Text = "Saves to: $(Get-DownloadDir)" }
+
+$startDownload = {
+    $u = $urlBox.Text
+    if (-not $u.Trim()) { return }
+    $dlBtn.Enabled = $false
+    try { Add-Download $u; $urlBox.Text = '' } finally { $dlBtn.Enabled = $true }
+}
+$dlBtn.Add_Click($startDownload)
+$urlBox.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; & $startDownload } })
+$dirBtn.Add_Click({
+    $fb = New-Object Windows.Forms.FolderBrowserDialog
+    $fb.SelectedPath = Get-DownloadDir
+    if ($fb.ShowDialog() -eq 'OK') { $script:Settings.downloadDir = $fb.SelectedPath; Save-Settings; Update-DirLabel }
+})
+$dlView.Add_SelectedIndexChanged({ Update-DlButtons })
+$pauseBtn.Add_Click({
+    $dl = Get-SelectedDownload
+    if (-not $dl) { return }
+    if ($dl.Status -eq 'Paused') { Resume-Download $dl } else { Suspend-Download $dl }
+    Refresh-DownloadList
+})
+$cancelBtn.Add_Click({
+    $dl = Get-SelectedDownload
+    if ($dl -and $dl.Status -in 'Downloading', 'Paused') { Remove-DownloadTemp $dl; $dl.Status = 'Cancelled'; $dl.Speed = 0; Refresh-DownloadList }
+})
+# Explorer opens files as you, not as administrator
+$openBtn.Add_Click({ $dl = Get-SelectedDownload; if ($dl -and (Test-Path $dl.Path)) { Start-Process explorer.exe -ArgumentList "`"$($dl.Path)`"" } })
+$showBtn.Add_Click({
+    $dl = Get-SelectedDownload
+    if (-not $dl) { return }
+    if (Test-Path $dl.Path) { Start-Process explorer.exe -ArgumentList "/select,`"$($dl.Path)`"" } else { Start-Process explorer.exe -ArgumentList "`"$(Split-Path $dl.Path)`"" }
+})
+$clearBtn.Add_Click({
+    foreach ($dl in $script:Downloads.ToArray()) { if ($dl.Status -eq 'Done' -or $dl.Status -like 'Failed*' -or $dl.Status -eq 'Cancelled') { [void]$script:Downloads.Remove($dl) } }
+    Refresh-DownloadList
+})
+$clipChk.Add_CheckedChanged({ $script:Settings.watchClipboard = $clipChk.Checked; Save-Settings })
+
+# Clipboard: a copied link fills the box; a link to a file also pops a tray message when the window is hidden
+$script:LastClip = ''
+$FileExt = 'zip|rar|7z|exe|msi|iso|img|bin|apk|xapk|obb|dmg|pkg|tar|gz|tgz|xz|bz2|zst|mp4|mkv|avi|mov|webm|mp3|flac|pdf|cab|appx|msix'
+function Watch-Clipboard {
+    if (-not $script:Settings.watchClipboard) { return }
+    try { if (-not [Windows.Forms.Clipboard]::ContainsText()) { return }; $txt = [Windows.Forms.Clipboard]::GetText().Trim() } catch { return }
+    if ($txt -eq $script:LastClip) { return }
+    $script:LastClip = $txt
+    if ($txt -notmatch '^https?://\S+$' -or $txt.Length -gt 4000) { return }
+    $urlBox.Text = $txt
+    $isFile = $txt -match "\.($FileExt)(\?|#|$)"
+    Set-DlStatus 'Link picked up from the clipboard - press Download'
+    if ($isFile -and -not $form.Visible) { $script:ClipBalloon = $true; $tray.ShowBalloonTip(4000, 'SteamBond', 'Download link copied - click here to download it with all your networks', 'Info') }
+}
+$tray.Add_BalloonTipClicked({ if ($script:ClipBalloon) { $script:ClipBalloon = $false; Show-Window; $tabs.SelectedTab = $tabDl } })
+
+$dlTimer = New-Object Windows.Forms.Timer
+$dlTimer.Interval = 250
+$dlTimer.Add_Tick({ if ($script:Downloads.Count) { Step-Downloads } })
+
 $exitApp = {
     $script:Exiting = $true
-    if ($script:Running) { Stop-Bond -Quiet }
+    if ($script:Running) { Stop-Bond -Quiet }; Stop-AllDownloads
     Save-History; Save-Settings
     $tray.Visible = $false
     $form.Close()
@@ -783,7 +1138,7 @@ $form.Add_FormClosing({
         return
     }
     $script:Exiting = $true
-    if ($script:Running) { Stop-Bond -Quiet }
+    if ($script:Running) { Stop-Bond -Quiet }; Stop-AllDownloads
     Save-History; Save-Settings
     $tray.Visible = $false
 })
@@ -794,6 +1149,8 @@ $timer.Add_Tick({
     $script:Tick++
     if ($script:ShowEvent.WaitOne(0)) { Show-Window }
     Update-Live
+    Watch-Clipboard
+    if ($script:Downloads.Count -and $tabs.SelectedTab -eq $tabDl -and $form.Visible) { Refresh-DownloadList }
     if ($script:Tick % 5 -eq 0) { Watch-Things }
     if ($script:Tick % 30 -eq 0) { Save-History; if ($tabs.SelectedTab -eq $tabHist -and $form.Visible) { Fill-History } }
     if ($script:Tick % 300 -eq 0) { $script:SteamLibs = Get-SteamLibraries }
@@ -808,7 +1165,7 @@ if ((Get-Process mihomo -ErrorAction SilentlyContinue) -and -not $env:STEAMBOND_
 
 $form.Add_Shown({
     if (-not $script:Settings.networks.Count) { $script:Settings.networks = @($script:Nets | ForEach-Object { $_.Name }); Save-Settings }
-    Fill-Networks; Update-SpeedLabel; Update-TaskLabel; Update-Buttons
+    Fill-Networks; Update-SpeedLabel; Update-TaskLabel; Update-Buttons; Update-DirLabel; Update-DlButtons; $dlTimer.Start()
     $script:SteamState = Get-SteamDownload
     $timer.Start()
     if ($env:STEAMBOND_SMOKETEST) { $t2 = New-Object Windows.Forms.Timer; $t2.Interval = [int]$env:STEAMBOND_SMOKETEST; $t2.Add_Tick({ $script:Exiting = $true; $form.Close() }); $t2.Start() }

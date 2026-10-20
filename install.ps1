@@ -1,4 +1,4 @@
-# SteamBond installer.
+﻿# SteamBond installer.
 # Copies the app to %LOCALAPPDATA%\SteamBond, downloads mihomo from its official GitHub release
 # (SHA-256 checked), adds Desktop + Start Menu shortcuts, an Apps & Features entry, and a scheduled
 # task so SteamBond opens with admin rights without a popup every time.
@@ -15,7 +15,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $Repo     = 'brutal888/SteamBond'
 $Branch   = 'main'
-$Version  = '2.0.0'
+$Version  = '2.1.0'
 $TaskName = 'SteamBond'
 $Mihomo = @{
     Version = 'v1.19.32'
