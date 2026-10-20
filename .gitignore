@@ -1,0 +1,13 @@
+# Built by make-setup.ps1 (attached to GitHub releases instead)
+dist/
+
+# Created at runtime next to the app
+mihomo.exe
+mihomo.version
+config.yaml
+settings.json
+history.json
+cache.db
+*.log
+*.err
+Start SteamBond.bat
