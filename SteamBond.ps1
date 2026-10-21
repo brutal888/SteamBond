@@ -128,12 +128,13 @@ function Measure-Speeds($nets) {
     $r
 }
 
+# Capped at 3:1 so one bad speed test can't leave a network almost idle
 function Get-Weights($speeds) {
     $w = @{}
     $pos = @($speeds.Values | Where-Object { $_ -gt 0 })
     $min = if ($pos.Count) { ($pos | Measure-Object -Minimum).Minimum } else { 0 }
     foreach ($k in $speeds.Keys) {
-        $w[$k] = if ($min -le 0 -or $speeds[$k] -le 0) { 1 } else { [int][math]::Min(3, [math]::Max(1, [math]::Round($speeds[$k] / $min)))   # capped: one bad test must not starve a network }
+        $w[$k] = if ($min -le 0 -or $speeds[$k] -le 0) { 1 } else { [int][math]::Min(3, [math]::Max(1, [math]::Round($speeds[$k] / $min))) }
     }
     $w
 }

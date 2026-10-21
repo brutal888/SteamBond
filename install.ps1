@@ -15,7 +15,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $Repo     = 'brutal888/SteamBond'
 $Branch   = 'main'
-$Version  = '2.1.1'
+$Version  = '2.1.2'
 $TaskName = 'SteamBond'
 $Mihomo = @{
     Version = 'v1.19.32'

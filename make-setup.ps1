@@ -6,6 +6,13 @@ $Dist  = Join-Path $Root 'dist'
 $Stage = Join-Path $Dist 'stage'
 New-Item -ItemType Directory -Force $Stage | Out-Null
 $files = 'install.ps1', 'SteamBond.ps1', 'SteamBond.ico', 'uninstall.ps1'
+
+# Never ship a script PowerShell can't parse (v2.1.1 did, and the app closed on launch)
+foreach ($f in $files | Where-Object { $_ -like '*.ps1' }) {
+    $tokens = $null; $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root $f), [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw "$f has syntax errors - not building: $($errors[0].Message) (line $($errors[0].Extent.StartLineNumber))" }
+}
 foreach ($f in $files) { Copy-Item (Join-Path $Root $f) $Stage -Force }
 
 $exe = Join-Path $Dist 'SteamBond-Setup.exe'
