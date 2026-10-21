@@ -354,6 +354,7 @@ function Stop-Bond([switch]$Quiet) {
 # A file is cut into chunks; each network runs a few curl.exe workers (more on faster networks) bound to
 # that network's IP, taking chunks from a shared queue. Works whether or not Start is pressed.
 $UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+$PlainAgent = 'SteamBond/2.1 (Windows)'
 $script:Downloads = New-Object Collections.Generic.List[object]
 $script:NextDownloadId = 1
 
@@ -370,7 +371,7 @@ function Start-Curl($argList) {
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = 'curl.exe'
     $psi.Arguments = ($argList | ForEach-Object { Quote-Arg $_ }) -join ' '
-    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardOutput = $true   # -w output (tiny)
     [Diagnostics.Process]::Start($psi)
 }
 
@@ -388,17 +389,17 @@ function Get-FreePath($dir, $name) {
 }
 
 # Asks the server for byte 0 only: a 206 answer means it can be split, Content-Range gives the size.
-function Test-DownloadUrl($url, $ip) {
+function Test-DownloadUrl($url, $ip, $ua = $UserAgent) {
     $hdr = Join-Path $env:TEMP "steambond-probe-$PID.txt"
-    $a = @('-4', '-s', '-L', '--max-redirs', '10', '-r', '0-0', '--max-filesize', '1', '-m', '20', '-A', $UserAgent, '-D', $hdr, '-o', 'NUL', '-w', '%{http_code}|%{url_effective}')
+    $a = @('-4', '-s', '-L', '--max-redirs', '10', '-r', '0-0', '--max-filesize', '1', '-m', '20', '-A', $ua, '-D', $hdr, '-o', 'NUL', '-w', '%{http_code}|%{url_effective}')
     if ($ip) { $a += @('--interface', $ip) }
     $p = Start-Curl ($a + $url)
     while (-not $p.HasExited) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
-    $res = @{ Code = 0; Size = -1; Ranges = $false; Name = $null; Error = $null }
+    $res = @{ Code = 0; Size = -1; Ranges = $false; Name = $null; Error = $null; UA = $ua }
     $headers = if (Test-Path $hdr) { Get-Content $hdr -Raw } else { '' }
     Remove-Item $hdr -ErrorAction SilentlyContinue
     # keep only the last response (after redirects)
-    $blocks = @($headers -split '(?m)^(?=HTTP/)') | Where-Object { $_.Trim() }
+    $blocks = @(@($headers -split '(?m)^(?=HTTP/)') | Where-Object { $_.Trim() })   # outer @() so one reply stays a list
     $last = if ($blocks.Count) { $blocks[-1] } else { '' }
     if ($last -match '^HTTP/\S+\s+(\d+)') { $res.Code = [int]$Matches[1] }
     if ($last -match '(?im)^content-range:\s*bytes\s+\d+-\d+/(\d+)') { $res.Size = [int64]$Matches[1]; $res.Ranges = ($res.Code -eq 206) }
@@ -433,7 +434,8 @@ function Add-Download($url) {
     Set-DlStatus 'Checking the link...'
     # Try the main network first, then the others, in case one of them is down
     $ips = @(Get-WantedNets | ForEach-Object { $n = $_; ($script:Nets | Where-Object { $_.Name -eq $n } | Select-Object -First 1).IP }) + @($null)
-    foreach ($ip in $ips) { $info = Test-DownloadUrl $url $ip; if ($info.Code -ne 0) { break } }
+    # Some servers hang up on browser-style requests; then retry as a plain downloader
+    foreach ($ip in $ips) { foreach ($ua in $UserAgent, $PlainAgent) { $info = Test-DownloadUrl $url $ip $ua; if ($info.Code -ne 0) { break } }; if ($info.Code -ne 0) { break } }
     if ($info.Error) { Set-DlStatus ''; [Windows.Forms.MessageBox]::Show($info.Error, 'SteamBond') | Out-Null; return }
     $dir = Get-DownloadDir
     $path = Get-FreePath $dir (Get-SafeName $info.Name)
@@ -455,7 +457,7 @@ function Add-Download($url) {
     }
     $dl = @{
         Id = $id; Url = $url; Name = [IO.Path]::GetFileName($path); Path = $path; Temp = $temp
-        Size = $info.Size; Ranges = $info.Ranges; Chunks = $chunks; Workers = $workers
+        Size = $info.Size; Ranges = $info.Ranges; UA = $info.UA; Chunks = $chunks; Workers = $workers
         Status = 'Downloading'; Done = 0L; NetBytes = @{}; Samples = New-Object Collections.Generic.List[object]
         Speed = 0.0; Merge = $null; Started = Get-Date
     }
@@ -512,24 +514,34 @@ function Step-Downloads {
                 } elseif ($c.End -ge 0 -and $len -gt $expected) {
                     $c.State = 'todo'; $c.Tries = 99   # server ignored the range request
                 } else {
-                    $c.State = 'todo'; $c.Tries++
+                    $http = ('' + $w.Proc.StandardOutput.ReadToEnd()).Trim()
+                    $c.State = 'todo'
                     Remove-Item (Get-PartPath $dl $c) -ErrorAction SilentlyContinue
+                    if ($http -in '429', '503') {
+                        # Server allows fewer connections: park this worker, keep at least one per network
+                        $active = @($dl.Workers | Where-Object { $_.Net -eq $w.Net -and -not $_.Parked }).Count
+                        if ($active -gt 1) { $w.Parked = $true } else { $w.WaitUntil = (Get-Date).AddSeconds(3) }
+                    } else {
+                        $c.Tries++
+                        $w.WaitUntil = (Get-Date).AddSeconds(2 * $c.Tries)
+                    }
+                    $w.LastHttp = $http
                 }
                 $w.LastExit = $w.Proc.ExitCode
                 $w.Proc = $null; $w.Chunk = $null; $w.Seen = 0L
                 if ($c.Tries -ge 6) {
                     Stop-DownloadWorkers $dl
-                    Set-DlStatus "$($dl.Name) failed"; $dl.Status = if ($c.Tries -eq 99) { 'Failed: server sent the wrong piece' } else { "Failed: piece kept failing (curl error $($w.LastExit))" }
+                    Set-DlStatus "$($dl.Name) failed"; $dl.Status = if ($c.Tries -eq 99) { 'Failed: server sent the wrong piece' } else { "Failed: piece kept failing (curl error $($w.LastExit), HTTP $($w.LastHttp))" }
                     Refresh-DownloadList; break
                 }
             }
             # give an idle worker the next piece (skip networks that are unplugged)
-            if (-not $w.Proc -and $w.Net -in $upNames) {
+            if (-not $w.Proc -and $w.Net -in $upNames -and -not $w.Parked -and (-not $w.WaitUntil -or (Get-Date) -ge $w.WaitUntil)) {
                 $c = $dl.Chunks | Where-Object { $_.State -eq 'todo' } | Select-Object -First 1
                 if ($c) {
                     $part = Get-PartPath $dl $c
                     Remove-Item $part -ErrorAction SilentlyContinue
-                    $a = @('-4', '-s', '-L', '--fail', '--max-redirs', '10', '--connect-timeout', '15', '--speed-limit', '2048', '--speed-time', '30', '-A', $UserAgent, '--interface', $w.IP, '-o', $part)
+                    $a = @('-4', '-s', '-L', '--fail', '--max-redirs', '10', '--connect-timeout', '15', '--speed-limit', '2048', '--speed-time', '30', '-A', $dl.UA, '--interface', $w.IP, '-o', $part, '-w', '%{http_code}')
                     if ($c.End -ge 0) { $a += @('-r', "$($c.Start)-$($c.End)") }
                     $w.Proc = Start-Curl ($a + $dl.Url)
                     $w.Chunk = $c; $w.Seen = 0L; $c.State = 'run'; $c.Net = $w.Net
